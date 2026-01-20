@@ -36,7 +36,7 @@ def main():
     }
     
     # 拼接获取列表的完整参数
-    list_url = f"{API_BASE}&endpoint=dns_records&action=list"
+    list_url = f"{API_BASE}&endpoint=subdomains&action=list"
 
     try:
         print(f"正在请求列表: {list_url}")
