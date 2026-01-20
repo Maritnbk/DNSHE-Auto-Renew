@@ -1,30 +1,33 @@
-name: DNSHE Auto Renew
+name: DNSHE Domain Auto Renew
 
 on:
   schedule:
-    # 每月1日北京时间 08:00 (UTC 00:00)
+    # 表达式说明：分钟 小时 天 月 星期
+    # 0 0 1 * * 表示 UTC 时间每月 1 日 00:00
+    # 对应北京时间 (UTC+8) 为每月 1 日 08:00
     - cron: '0 0 1 * *'
-  workflow_dispatch: 
+  workflow_dispatch: # 依然保留手动触发按钮，方便测试
 
 jobs:
   renew:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出代码
+      - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: 设置 Python
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
 
-      - name: 安装依赖
+      - name: Install dependencies
         run: pip install requests
 
-      - name: 执行续期脚本
+      - name: Run renew script
         env:
-          DNSHE_KEY: ${{ secrets.DNSHE_KEY }}
-          DNSHE_SECRET: ${{ secrets.DNSHE_SECRET }}
+          # 以下变量需在仓库 Settings -> Secrets -> Actions 中配置 
+          DNSHE_API_KEY: ${{ secrets.DNSHE_API_KEY }}
+          DNSHE_API_SECRET: ${{ secrets.DNSHE_API_SECRET }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           PUSHPLUS_TOPIC: ${{ secrets.PUSHPLUS_TOPIC }}
-        run: python dnshe_renew.py
+        run: python renew_domains.py
