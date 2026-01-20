@@ -2,10 +2,8 @@ import requests
 import os
 import json
 
-# 直接硬编码 API 基础地址
+# 基于最新文档的配置 [cite: 1, 17]
 API_BASE = "https://api005.dnshe.com/index.php?m=domain_hub"
-
-# 从 Secrets 获取密钥和推送配置
 API_KEY = os.getenv('DNSHE_KEY')
 API_SECRET = os.getenv('DNSHE_SECRET')
 PUSHPLUS_TOKEN = os.getenv('PUSHPLUS_TOKEN')
@@ -18,33 +16,34 @@ def send_pushplus(content):
     url = "http://www.pushplus.plus/send"
     data = {
         "token": PUSHPLUS_TOKEN,
-        "title": "DNSHE 域名续期报告",
+        "title": "DNSHE 域名续期任务报告",
         "content": content,
         "template": "markdown",
         "topic": PUSHPLUS_TOPIC
     }
     try:
         requests.post(url, json=data, timeout=10)
-    except:
-        pass
+    except Exception as e:
+        print(f"推送失败: {e}")
 
 def main():
+    # 认证头部信息 [cite: 1, 18]
     headers = {
         "X-API-Key": API_KEY,
         "X-API-Secret": API_SECRET,
+        "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     
-    # 拼接获取列表的完整参数
+    # 1. 获取子域名列表 [cite: 21, 22]
     list_url = f"{API_BASE}&endpoint=subdomains&action=list"
 
     try:
-        print(f"正在请求列表: {list_url}")
+        print(f"正在获取域名列表...")
         response = requests.get(list_url, headers=headers, timeout=20)
         
-        # 调试输出
         if response.status_code != 200:
-            err_msg = f"❌ API 访问失败\n状态码: {response.status_code}\n地址: {list_url}"
+            err_msg = f"❌ API 请求失败，状态码: {response.status_code}"
             print(err_msg)
             send_pushplus(err_msg)
             return
@@ -55,28 +54,38 @@ def main():
             return
         
         subdomains = res_data.get("subdomains", [])
-        results = []
+        if not subdomains:
+            send_pushplus("ℹ️ 账号下暂无可用域名。")
+            return
 
-        # 遍历域名并执行续期
+        results = []
+        # 2. 遍历执行续期 (使用 POST 方法) 
+        renew_url = f"{API_BASE}&endpoint=subdomains&action=renew"
+        
         for domain in subdomains:
             domain_id = domain['id']
-            domain_name = domain['subdomain']
+            domain_name = domain.get('full_domain') or domain.get('subdomain') [cite: 2]
             
-            # 续期命令通过在列表 URL 后追加 subdomain_id 实现
-            renew_url = f"{list_url}&subdomain_id={domain_id}"
-            print(f"尝试续期: {domain_name} (ID: {domain_id})")
+            print(f"正在尝试续期: {domain_name} (ID: {domain_id})")
+            
+            # 准备 POST 数据 
+            payload = {"subdomain_id": domain_id}
             
             try:
-                renew_res = requests.get(renew_url, headers=headers, timeout=20).json()
+                # 执行 POST 续期请求 
+                renew_res = requests.post(renew_url, headers=headers, json=payload, timeout=20).json()
+                
                 if renew_res.get("success"):
-                    # 记录新到期时间
-                    results.append(f"✅ **{domain_name}**: 成功 (到期: {renew_res.get('new_expires_at')})")
+                    # 续期成功，记录新到期时间 
+                    results.append(f"✅ **{domain_name}**: 成功 (新到期: {renew_res.get('new_expires_at')})")
                 else:
-                    # 记录未成功原因（例如：距离到期还超过 180 天）
-                    results.append(f"ℹ️ **{domain_name}**: {renew_res.get('message', '未触发续期')}")
-            except:
-                results.append(f"❌ **{domain_name}**: 解析返回数据失败")
+                    # 记录未成功原因 
+                    msg = renew_res.get('message', '未触发续期')
+                    results.append(f"ℹ️ **{domain_name}**: {msg}")
+            except Exception as e:
+                results.append(f"❌ **{domain_name}**: 请求异常 ({str(e)})")
 
+        # 3. 汇总发送报告
         report = "### DNSHE 自动续期任务完成\n" + "\n".join(results)
         print(report)
         send_pushplus(report)
