@@ -2,9 +2,9 @@ name: DNSHE Auto Renew
 
 on:
   schedule:
-    # 每月1日北京时间 08:00 运行 (对应 UTC 00:00)
+    # 每月1日北京时间 08:00 运行 (UTC 00:00)
     - cron: '0 0 1 * *'
-  workflow_dispatch: # 保持手动触发功能，方便测试
+  workflow_dispatch: 
 
 jobs:
   renew:
@@ -23,6 +23,7 @@ jobs:
 
       - name: 执行续期脚本
         env:
+          # 只保留必要的 Secrets
           DNSHE_KEY: ${{ secrets.DNSHE_KEY }}
           DNSHE_SECRET: ${{ secrets.DNSHE_SECRET }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
