@@ -1,0 +1,30 @@
+name: DNSHE Auto Renew
+
+on:
+  schedule:
+    # 每月1日北京时间 08:00 运行 (对应 UTC 00:00)
+    - cron: '0 0 1 * *'
+  workflow_dispatch: # 保持手动触发功能，方便测试
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v3
+
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: 安装依赖
+        run: pip install requests
+
+      - name: 执行续期脚本
+        env:
+          DNSHE_KEY: ${{ secrets.DNSHE_KEY }}
+          DNSHE_SECRET: ${{ secrets.DNSHE_SECRET }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          PUSHPLUS_TOPIC: ${{ secrets.PUSHPLUS_TOPIC }}
+        run: python dnshe_renew.py
