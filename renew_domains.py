@@ -1,33 +1,76 @@
 import requests
-import json
 import os
+import smtplib
+import ssl
 from datetime import datetime
+from email.message import EmailMessage
 
 # 从环境变量获取配置
 API_KEY = os.environ.get('DNSHE_API_KEY')
 API_SECRET = os.environ.get('DNSHE_API_SECRET')
-PUSHPLUS_TOKEN = os.environ.get('PUSHPLUS_TOKEN')
-PUSHPLUS_TOPIC = os.environ.get('PUSHPLUS_TOPIC')  # 群组编码
+SMTP_HOST = os.environ.get('SMTP_HOST')
+SMTP_PORT = os.environ.get('SMTP_PORT') or '465'
+SMTP_USER = os.environ.get('SMTP_USER')
+SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD')
+SMTP_FROM = os.environ.get('SMTP_FROM') or SMTP_USER
+SMTP_TO = os.environ.get('SMTP_TO')
 
 BASE_URL = "https://api005.dnshe.com/index.php?m=domain_hub"
 
 # 续期阈值：到期时间小于该天数则执行续期
 RENEW_THRESHOLD_DAYS = 180
 
-def send_pushplus(content):
-    if not PUSHPLUS_TOKEN:
-        print("未配置 PushPlus Token，跳过推送")
+def _get_bool_env(name, default):
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {'1', 'true', 'yes', 'on'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'off'}:
+        return False
+    raise ValueError(f"{name} 必须是 true/false")
+
+
+def send_smtp(content):
+    if not SMTP_HOST or not SMTP_TO:
+        print("未配置 SMTP_HOST 或 SMTP_TO，跳过邮件推送")
         return
-    
-    url = "http://www.pushplus.plus/send"
-    data = {
-        "token": PUSHPLUS_TOKEN,
-        "title": "DNSHE 域名自动续期报告",
-        "content": content,
-        "template": "txt",
-        "topic": PUSHPLUS_TOPIC
-    }
-    requests.post(url, json=data)
+
+    recipients = [address.strip() for address in SMTP_TO.split(',') if address.strip()]
+    if not recipients:
+        print("SMTP_TO 未包含有效的收件人，跳过邮件推送")
+        return
+    if not SMTP_FROM:
+        print("未配置 SMTP_FROM 或 SMTP_USER，跳过邮件推送")
+        return
+
+    try:
+        port = int(SMTP_PORT)
+        use_ssl = _get_bool_env('SMTP_USE_SSL', port == 465)
+        use_starttls = _get_bool_env('SMTP_USE_STARTTLS', not use_ssl)
+        if use_ssl and use_starttls:
+            raise ValueError("SMTP_USE_SSL 和 SMTP_USE_STARTTLS 不能同时启用")
+        if bool(SMTP_USER) != bool(SMTP_PASSWORD):
+            raise ValueError("SMTP_USER 和 SMTP_PASSWORD 必须同时配置")
+
+        message = EmailMessage()
+        message['Subject'] = 'DNSHE 域名自动续期报告'
+        message['From'] = SMTP_FROM
+        message['To'] = ', '.join(recipients)
+        message.set_content(content)
+
+        smtp_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+        with smtp_class(SMTP_HOST, port, timeout=30) as server:
+            if use_starttls:
+                server.starttls(context=ssl.create_default_context())
+            if SMTP_USER:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(message, from_addr=SMTP_FROM, to_addrs=recipients)
+        print("SMTP 邮件推送成功")
+    except Exception as e:
+        print(f"SMTP 邮件推送失败: {str(e)}")
 
 def main():
     headers = {
@@ -42,7 +85,7 @@ def main():
         resp = requests.get(list_url, headers=headers)
         subdomains = resp.json().get('subdomains', [])
     except Exception as e:
-        send_pushplus(f"获取域名列表失败: {str(e)}")
+        send_smtp(f"获取域名列表失败: {str(e)}")
         return
 
     today = datetime.now()
@@ -111,7 +154,7 @@ def main():
 
     message = "\n".join(message_parts)
     print(message)
-    send_pushplus(message)
+    send_smtp(message)
 
 if __name__ == "__main__":
     main()

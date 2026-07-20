@@ -1,6 +1,6 @@
 # DNSHE 域名自动续期助手
 
-本项目是一个基于 GitHub Actions 的自动化脚本，旨在利用 **DNSHE 免费域名 API**  实现子域名的自动续期，并通过 **PushPlus** 推送执行结果，确保您的免费域名永不过期。
+本项目是一个基于 GitHub Actions 的自动化脚本，旨在利用 **DNSHE 免费域名 API**  实现子域名的自动续期，并通过 **SMTP 邮件** 推送执行结果，确保您的免费域名永不过期。
 
 ## 🌟 功能特性
 
@@ -8,7 +8,7 @@
 
 - **多域名支持**：自动遍历账户下所有子域名进行批量续期 。
 
-- **即时通知**：通过 PushPlus 推送详细报告，结果逐行显示，清晰直观。
+- **即时通知**：通过 SMTP 邮件推送详细报告，结果逐行显示，清晰直观。
 
 - **安全合规**：采用 GitHub Secrets 管理密钥，不在代码中硬编码敏感信息 。
 
@@ -23,6 +23,8 @@
 - **永不过期识别**：识别已设置为永不过期的域名，自动跳过续期。
 
 - **通知优化**：推送消息分为两段——第一段展示本次续期结果，第二段汇总所有域名到期时间。
+
+- **通知方式**：使用 SMTP 邮件发送执行报告。
 
 ***
 
@@ -40,11 +42,17 @@
 
 
 
-### 第二步：获取推送 Token
+### 第二步：准备 SMTP 邮箱
 
-1. 访问 [PushPlus 官网](https://www.pushplus.plus/)。
-2. 登录并获取您的 **Token**。
-3. （可选）若需推送到群组，请创建一个群组并记录 **群组编码 (Topic)**。
+准备 SMTP 服务商提供的服务器地址、端口、账号和密码（部分服务商要求使用“客户端专用密码”或“授权码”）。常见配置如下：
+
+| 服务商 | `SMTP_HOST` | `SMTP_PORT` | 加密方式 |
+| ------ | ---------- | ----------- | -------- |
+| QQ 邮箱 | `smtp.qq.com` | `465` | SSL |
+| 163 邮箱 | `smtp.163.com` | `465` | SSL |
+| Gmail | `smtp.gmail.com` | `587` | STARTTLS |
+
+465 端口默认使用 SSL，其他端口默认使用 STARTTLS；也可以通过 `SMTP_USE_SSL` 和 `SMTP_USE_STARTTLS` 显式指定。
 
 ### 第三步：配置 GitHub 仓库
 
@@ -56,8 +64,14 @@
 | ------------------ | ------------------ | ----------------- |
 | `DNSHE_API_KEY`    | DNSHE 的 API Key    | `cfsd_xxxxxxxxxx` |
 | `DNSHE_API_SECRET` | DNSHE 的 API Secret | `yyyyyyyyyyyy`    |
-| `PUSHPLUS_TOKEN`   | PushPlus 的用户令牌     | `9a8b...`         |
-| `PUSHPLUS_TOPIC`   | (可选) PushPlus 群组编码 | `123`             |
+| `SMTP_HOST`        | SMTP 服务器地址       | `smtp.qq.com`    |
+| `SMTP_PORT`        | SMTP 服务器端口       | `465`            |
+| `SMTP_USER`        | SMTP 登录账号         | `your@qq.com`    |
+| `SMTP_PASSWORD`    | SMTP 密码或授权码     | `xxxxxxxx`       |
+| `SMTP_FROM`        | 发件人地址（可选，默认使用 `SMTP_USER`） | `your@qq.com` |
+| `SMTP_TO`          | 收件人地址，多个地址用英文逗号分隔 | `me@example.com` |
+| `SMTP_USE_SSL`     | 是否使用 SSL（可选）  | `true`           |
+| `SMTP_USE_STARTTLS` | 是否使用 STARTTLS（可选） | `false`       |
 
 ### 第四步：启用自动化
 
