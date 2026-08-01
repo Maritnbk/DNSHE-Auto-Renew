@@ -47,7 +47,7 @@ def main():
 
     today = datetime.now()
     renewal_results = []  # 第一段：本次续期结果
-    expiry_info = []      # 第二段：所有域名到期时间
+    expiry_info = {}      # 第二段：所有域名到期时间（以域名为键，续期后可更新）
 
     # 2. 遍历域名，检查到期时间并选择性续期
     for domain in subdomains:
@@ -58,7 +58,7 @@ def main():
 
         # 检查是否为永不过期域名
         if never_expires:
-            expiry_info.append(f"{full_domain}: 到期时间 永久有效")
+            expiry_info[full_domain] = f"{full_domain}: 到期时间 永久有效"
             renewal_results.append(f"⏭️ {full_domain}: 已设置为永不过期，跳过续期")
             continue
 
@@ -72,9 +72,9 @@ def main():
 
         # 记录到期信息（第二段用）
         if days_remaining is not None:
-            expiry_info.append(f"{full_domain}: 到期时间 {expires_at_str} (剩余 {days_remaining}天)")
+            expiry_info[full_domain] = f"{full_domain}: 到期时间 {expires_at_str} (剩余 {days_remaining}天)"
         else:
-            expiry_info.append(f"{full_domain}: 到期时间 未知")
+            expiry_info[full_domain] = f"{full_domain}: 到期时间 未知"
 
         # 判断是否需要续期：剩余天数 < 180天 才续期
         if days_remaining is not None and days_remaining >= RENEW_THRESHOLD_DAYS:
@@ -91,6 +91,16 @@ def main():
                 new_expiry = r_resp.get('new_expires_at', '未知')
                 charged = r_resp.get('charged_amount', 0)
                 renewal_results.append(f"✅ {full_domain}: 续期成功 (新到期: {new_expiry}, 消耗: {charged}积分)")
+                # 同步更新第二段的到期时间为续期后的新时间
+                if new_expiry != '未知':
+                    try:
+                        new_expires_at = datetime.strptime(new_expiry, '%Y-%m-%d %H:%M:%S')
+                        new_days_remaining = (new_expires_at - today).days
+                        expiry_info[full_domain] = f"{full_domain}: 到期时间 {new_expiry} (剩余 {new_days_remaining}天)"
+                    except ValueError:
+                        expiry_info[full_domain] = f"{full_domain}: 到期时间 {new_expiry}"
+                else:
+                    expiry_info[full_domain] = f"{full_domain}: 到期时间 {new_expiry}"
             else:
                 msg = r_resp.get('message', '未知错误')
                 renewal_results.append(f"❌ {full_domain}: 续期失败 ({msg})")
@@ -107,7 +117,7 @@ def main():
 
     message_parts.append("")
     message_parts.append("=== 所有域名到期时间 ===")
-    message_parts.extend(expiry_info)
+    message_parts.extend(expiry_info.values())
 
     message = "\n".join(message_parts)
     print(message)
