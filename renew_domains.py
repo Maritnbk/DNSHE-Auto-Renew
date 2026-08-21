@@ -17,27 +17,22 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# 默认 API 入口。主机名带编号（api005），官方可能新增或切换节点，
-# 因此允许用 DNSHE_API_BASE_URL 覆盖，无需改代码。
 DEFAULT_BASE_URL = "https://api005.dnshe.com/index.php?m=domain_hub"
 
-# 必须用 https，否则 PushPlus token 会明文上网
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
 
-# (连接超时, 读取超时)，避免请求挂死导致 Actions 长时间空转
+TELEGRAM_API_BASE = "https://api.telegram.org"
+
+TELEGRAM_MESSAGE_LIMIT = 4096
+
 REQUEST_TIMEOUT = (10, 30)
 
-# 官方「续期窗口」：域名到期前 180 天开启
 DEFAULT_THRESHOLD_DAYS = 180
 
-# 官方限流 30 次/分钟，2 秒间隔留出余量
 DEFAULT_MIN_INTERVAL = 2
 
-# DNSHE 是国内服务，响应里的时间戳不带时区后缀，文档也未说明。
-# 默认按北京时间解读，可用 DNSHE_TZ_OFFSET 覆盖。
 DEFAULT_TZ_OFFSET_HOURS = 8.0
 
-# list 接口 per_page 默认 200、上限 500，不分页会静默截断
 PAGE_SIZE = 200
 MAX_PAGES = 100
 
@@ -45,8 +40,6 @@ LIST_FIELDS = "id,subdomain,rootdomain,full_domain,status,expires_at,never_expir
 
 EXPIRY_FORMATS = ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d')
 
-# 到期前 180 天以外调用续期接口会返回 422 renewal_not_yet_available，
-# 这是预期内的"还没到续期窗口"，不是故障，不该计入失败。
 BENIGN_ERROR_CODES = frozenset({'renewal_not_yet_available'})
 
 
@@ -109,6 +102,8 @@ class Config:
     api_secret: str = ""
     pushplus_token: str = ""
     pushplus_topic: str = ""
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
     base_url: str = DEFAULT_BASE_URL
     threshold_days: int = DEFAULT_THRESHOLD_DAYS
     min_interval: float = DEFAULT_MIN_INTERVAL
@@ -126,6 +121,8 @@ class Config:
             api_secret=text('DNSHE_API_SECRET'),
             pushplus_token=text('PUSHPLUS_TOKEN'),
             pushplus_topic=text('PUSHPLUS_TOPIC'),
+            telegram_bot_token=text('TELEGRAM_BOT_TOKEN'),
+            telegram_chat_id=text('TELEGRAM_CHAT_ID'),
             base_url=text('DNSHE_API_BASE_URL') or DEFAULT_BASE_URL,
             threshold_days=env_number(env, 'DNSHE_RENEW_THRESHOLD_DAYS',
                                       DEFAULT_THRESHOLD_DAYS, int),
@@ -473,7 +470,7 @@ def quota_line(quota):
     return f"账户积分：{summary}"
 
 
-class Notifier:
+class PushPlusNotifier:
     def __init__(self, token, topic='', session=None):
         self.token = token
         self.topic = topic
@@ -508,6 +505,97 @@ class Notifier:
         except Exception as e:
             warn(f"PushPlus 推送失败: {e}")
             return False
+
+
+def split_message(content, limit=TELEGRAM_MESSAGE_LIMIT):
+    """把超长报告切成若干条不超过 limit 的消息。
+
+    优先在最近的换行处断开，避免把一行域名记录切成两半；
+    单行本身就超限时才在行内硬切。
+    """
+    chunks = []
+    remaining = content
+    while len(remaining) > limit:
+        cut = remaining.rfind('\n', 0, limit + 1)
+        if cut <= 0:
+            cut = limit
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip('\n')
+    chunks.append(remaining)
+    return chunks
+
+
+class TelegramNotifier:
+    """通过 Telegram Bot API 推送，纯文本发送，超长报告自动分段顺序发送。
+
+    不用 parse_mode：报告含 emoji、域名和接口错误原文，Markdown 转义
+    易漏易错且没有收益。
+    """
+
+    def __init__(self, bot_token, chat_id, session=None):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.session = session or build_session(notify_retry())
+
+    def send(self, content):
+        """返回是否全部发送成功。本方法绝不抛异常，否则会吞掉它要上报的错误。"""
+        if not self.bot_token or not self.chat_id:
+            print("未配置 Telegram Bot Token 或 Chat ID，跳过推送")
+            return True
+
+        url = f"{TELEGRAM_API_BASE}/bot{self.bot_token}/sendMessage"
+        ok = True
+        for index, chunk in enumerate(split_message(content), start=1):
+            data = {"chat_id": self.chat_id, "text": chunk}
+            try:
+                resp = self.session.post(url, json=data, timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                try:
+                    result = resp.json()
+                except ValueError:
+                    warn(f"Telegram 返回非 JSON 内容: {(resp.text or '')[:200]}")
+                    ok = False
+                    continue
+                # Telegram 约定 ok=true 为成功；ok=false 时 description 带原因
+                if not (isinstance(result, dict) and result.get('ok')):
+                    warn(f"Telegram 第 {index} 段推送未成功: {result.get('description', result)}")
+                    ok = False
+            except Exception as e:
+                warn(f"Telegram 第 {index} 段推送失败: {e}")
+                ok = False
+        if ok:
+            print("Telegram 推送成功")
+        return ok
+
+
+class CompositeNotifier:
+    """把报告分发给所有已配置的通知通道。
+
+    - 未配置任何通道：提示后视为成功（与原先无 PushPlus token 时一致）
+    - 任一已配置通道失败：返回 False，让进程以退出码 1 收场——
+      报告发不出去等于没有告警通道
+    """
+
+    def __init__(self, channels):
+        self.channels = channels
+
+    def send(self, content):
+        if not self.channels:
+            print("未配置任何通知通道，跳过推送")
+            return True
+        return all(channel.send(content) for channel in self.channels)
+
+
+def build_notifier(config):
+    """按 Config 装配所有已配置的通知通道，供主流程与异常兜底共用。"""
+    channels = []
+    if config.pushplus_token:
+        channels.append(PushPlusNotifier(config.pushplus_token, config.pushplus_topic))
+    if config.telegram_bot_token and config.telegram_chat_id:
+        channels.append(TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id))
+    elif config.telegram_bot_token or config.telegram_chat_id:
+        warn("TELEGRAM_BOT_TOKEN 与 TELEGRAM_CHAT_ID 需同时配置，已忽略不完整的 Telegram 配置")
+    return CompositeNotifier(channels)
 
 
 def build_message(config, quota_text, renewal_results, expiry_lines, has_failure):
@@ -628,7 +716,7 @@ def run(config, client, notifier, now=None):
 def main():
     configure_streams()
     config = Config.from_env()
-    notifier = Notifier(config.pushplus_token, config.pushplus_topic)
+    notifier = build_notifier(config)
 
     missing = config.missing_credentials()
     if missing:
@@ -653,8 +741,7 @@ if __name__ == "__main__":
         detail = traceback.format_exc()
         print(detail, file=sys.stderr)
         try:
-            Notifier(os.environ.get('PUSHPLUS_TOKEN', ''),
-                     os.environ.get('PUSHPLUS_TOPIC', '')).send(
+            build_notifier(Config.from_env()).send(
                 f"⚠️ 续期脚本异常中断，本次续期未完成\n\n{detail[-1500:]}")
         except Exception:
             pass
