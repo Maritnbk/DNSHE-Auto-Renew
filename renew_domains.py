@@ -525,6 +525,21 @@ def split_message(content, limit=TELEGRAM_MESSAGE_LIMIT):
     return chunks
 
 
+def telegram_error_detail(resp):
+    """提取错误响应体里的原因。
+
+    Telegram 的 4xx/5xx 响应体带 JSON description（如「bot was blocked by
+    the user」），比状态码本身有用得多；非 JSON 时退回原文片段。
+    """
+    try:
+        payload = resp.json()
+    except ValueError:
+        return (resp.text or '')[:200]
+    if isinstance(payload, dict) and payload.get('description'):
+        return str(payload['description'])
+    return str(payload)[:200]
+
+
 class TelegramNotifier:
     """通过 Telegram Bot API 推送，纯文本发送，超长报告自动分段顺序发送。
 
@@ -561,7 +576,14 @@ class TelegramNotifier:
                     warn(f"Telegram 第 {index} 段推送未成功: {result.get('description', result)}")
                     ok = False
             except Exception as e:
-                warn(f"Telegram 第 {index} 段推送失败: {e}")
+                # raise_for_status 抛出的 HTTPError 带着响应体，里面的
+                # description 才是 403/400 的真正原因，不能只报状态码
+                err_resp = getattr(e, 'response', None)
+                if err_resp is not None:
+                    warn(f"Telegram 第 {index} 段推送失败 "
+                         f"(HTTP {err_resp.status_code}): {telegram_error_detail(err_resp)}")
+                else:
+                    warn(f"Telegram 第 {index} 段推送失败: {e}")
                 ok = False
         if ok:
             print("Telegram 推送成功")
