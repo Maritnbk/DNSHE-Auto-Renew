@@ -19,11 +19,10 @@ from urllib3.util.retry import Retry
 
 DEFAULT_BASE_URL = "https://api005.dnshe.com/index.php?m=domain_hub"
 
-PUSHPLUS_URL = "https://www.pushplus.plus/send"
-
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
 TELEGRAM_MESSAGE_LIMIT = 4096
+WECOM_MESSAGE_LIMIT_BYTES = 2048
 
 REQUEST_TIMEOUT = (10, 30)
 
@@ -100,8 +99,7 @@ def format_offset(tz):
 class Config:
     api_key: str = ""
     api_secret: str = ""
-    pushplus_token: str = ""
-    pushplus_topic: str = ""
+    wechat_work_webhook_url: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     base_url: str = DEFAULT_BASE_URL
@@ -119,8 +117,9 @@ class Config:
         return cls(
             api_key=text('DNSHE_API_KEY'),
             api_secret=text('DNSHE_API_SECRET'),
-            pushplus_token=text('PUSHPLUS_TOKEN'),
-            pushplus_topic=text('PUSHPLUS_TOPIC'),
+            wechat_work_webhook_url=(
+                text('WECHAT_WORK_WEBHOOK_URL') or text('WECHAT_WEBHOOK_URL')
+            ),
             telegram_bot_token=text('TELEGRAM_BOT_TOKEN'),
             telegram_chat_id=text('TELEGRAM_CHAT_ID'),
             base_url=text('DNSHE_API_BASE_URL') or DEFAULT_BASE_URL,
@@ -470,43 +469,6 @@ def quota_line(quota):
     return f"账户积分：{summary}"
 
 
-class PushPlusNotifier:
-    def __init__(self, token, topic='', session=None):
-        self.token = token
-        self.topic = topic
-        self.session = session or build_session(notify_retry())
-
-    def send(self, content):
-        """返回是否成功。本方法绝不抛异常，否则会吞掉它要上报的错误。"""
-        if not self.token:
-            print("未配置 PushPlus Token，跳过推送")
-            return True
-
-        data = {
-            "token": self.token,
-            "title": "DNSHE 域名自动续期报告",
-            "content": content,
-            "template": "txt",
-            "topic": self.topic,
-        }
-        try:
-            resp = self.session.post(PUSHPLUS_URL, json=data, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            try:
-                result = resp.json()
-            except ValueError:
-                warn(f"PushPlus 返回非 JSON 内容: {(resp.text or '')[:200]}")
-                return False
-            if isinstance(result, dict) and result.get('code') != 200:
-                warn(f"PushPlus 推送未成功 (code={result.get('code')}): {result.get('msg')}")
-                return False
-            print("PushPlus 推送成功")
-            return True
-        except Exception as e:
-            warn(f"PushPlus 推送失败: {e}")
-            return False
-
-
 def split_message(content, limit=TELEGRAM_MESSAGE_LIMIT):
     """把超长报告切成若干条不超过 limit 的消息。
 
@@ -522,6 +484,45 @@ def split_message(content, limit=TELEGRAM_MESSAGE_LIMIT):
         chunks.append(remaining[:cut])
         remaining = remaining[cut:].lstrip('\n')
     chunks.append(remaining)
+    return chunks
+
+
+def split_message_by_bytes(content, limit):
+    """按 UTF-8 字节数切分消息，优先在换行处断开。"""
+    if len(content.encode('utf-8')) <= limit:
+        return [content]
+
+    chunks = []
+    remaining = content
+    while remaining:
+        if len(remaining.encode('utf-8')) <= limit:
+            chunks.append(remaining)
+            break
+        cut = None
+        byte_count = 0
+        for index, char in enumerate(remaining):
+            char_bytes = len(char.encode('utf-8'))
+            if byte_count + char_bytes > limit:
+                break
+            byte_count += char_bytes
+            if char == '\n':
+                cut = index
+
+        if cut is None:
+            # 单行过长时按字符边界硬切，避免切坏 UTF-8
+            byte_count = 0
+            cut = 0
+            for index, char in enumerate(remaining):
+                char_bytes = len(char.encode('utf-8'))
+                if byte_count + char_bytes > limit:
+                    break
+                byte_count += char_bytes
+                cut = index + 1
+        else:
+            cut += 1
+
+        chunks.append(remaining[:cut].rstrip('\n'))
+        remaining = remaining[cut:].lstrip('\n')
     return chunks
 
 
@@ -590,10 +591,68 @@ class TelegramNotifier:
         return ok
 
 
+def wecom_error_detail(resp):
+    try:
+        payload = resp.json()
+    except ValueError:
+        return (resp.text or '')[:200]
+    if isinstance(payload, dict):
+        errcode = payload.get('errcode')
+        errmsg = payload.get('errmsg')
+        if errcode is not None or errmsg:
+            return f"errcode={errcode}, errmsg={errmsg}"
+    return str(payload)[:200]
+
+
+class WeComNotifier:
+    """通过企业微信机器人 Webhook 推送纯文本，超长报告自动按字节分段。"""
+
+    def __init__(self, webhook_url, session=None):
+        self.webhook_url = webhook_url
+        self.session = session or build_session(notify_retry())
+
+    def send(self, content):
+        """返回是否全部发送成功。本方法绝不抛异常，否则会吞掉它要上报的错误。"""
+        if not self.webhook_url:
+            print("未配置企业微信机器人 Webhook，跳过推送")
+            return True
+
+        ok = True
+        chunks = split_message_by_bytes(content, WECOM_MESSAGE_LIMIT_BYTES)
+        for index, chunk in enumerate(chunks, start=1):
+            data = {"msgtype": "text", "text": {"content": chunk}}
+            try:
+                resp = self.session.post(self.webhook_url, json=data, timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                try:
+                    result = resp.json()
+                except ValueError:
+                    warn(f"企业微信第 {index} 段返回非 JSON 内容: {(resp.text or '')[:200]}")
+                    ok = False
+                    continue
+                if not (isinstance(result, dict) and result.get('errcode') == 0):
+                    warn(
+                        f"企业微信第 {index} 段推送未成功 "
+                        f"(errcode={result.get('errcode')}, errmsg={result.get('errmsg')})"
+                    )
+                    ok = False
+            except Exception as e:
+                err_resp = getattr(e, 'response', None)
+                if err_resp is not None:
+                    warn(f"企业微信第 {index} 段推送失败 "
+                         f"(HTTP {err_resp.status_code}): {wecom_error_detail(err_resp)}")
+                else:
+                    warn(f"企业微信第 {index} 段推送失败: {e}")
+                ok = False
+        if ok:
+            print("企业微信推送成功")
+        return ok
+
+
 class CompositeNotifier:
     """把报告分发给所有已配置的通知通道。
 
-    - 未配置任何通道：提示后视为成功（与原先无 PushPlus token 时一致）
+    - 未配置任何通道：提示后视为成功
     - 任一已配置通道失败：返回 False，让进程以退出码 1 收场——
       报告发不出去等于没有告警通道
     """
@@ -611,8 +670,8 @@ class CompositeNotifier:
 def build_notifier(config):
     """按 Config 装配所有已配置的通知通道，供主流程与异常兜底共用。"""
     channels = []
-    if config.pushplus_token:
-        channels.append(PushPlusNotifier(config.pushplus_token, config.pushplus_topic))
+    if config.wechat_work_webhook_url:
+        channels.append(WeComNotifier(config.wechat_work_webhook_url))
     if config.telegram_bot_token and config.telegram_chat_id:
         channels.append(TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id))
     elif config.telegram_bot_token or config.telegram_chat_id:

@@ -1,6 +1,6 @@
 # DNSHE 域名自动续期助手
 
-本项目是一个基于 GitHub Actions 的自动化脚本，旨在利用 **DNSHE 免费域名 API**  实现子域名的自动续期，并通过 **PushPlus / Telegram Bot** 推送执行结果，确保您的免费域名永不过期。
+本项目是一个基于 GitHub Actions 的自动化脚本，旨在利用 **DNSHE 免费域名 API**  实现子域名的自动续期，并通过 **企业微信机器人 / Telegram Bot** 推送执行结果，确保您的免费域名永不过期。
 
 ## 🌟 功能特性
 
@@ -8,7 +8,7 @@
 
 - **多域名支持**：自动遍历账户下所有子域名进行批量续期 。
 
-- **即时通知**：通过 PushPlus / Telegram Bot 推送详细报告，结果逐行显示，清晰直观。
+- **即时通知**：通过企业微信机器人 / Telegram Bot 推送详细报告，结果逐行显示，清晰直观。
 
 - **安全合规**：采用 GitHub Secrets 管理密钥，不在代码中硬编码敏感信息 。
 
@@ -18,7 +18,7 @@
 
 （2026-08-21）
 
-- **通知渠道扩展**：新增 Telegram Bot 通知方式，可与 PushPlus 并存，未配置则自动跳过。
+- **通知渠道扩展**：新增 Telegram Bot 通知方式，可与企业微信机器人并存，未配置则自动跳过。
 
 - **长报告适配**：超过 Telegram 单条消息长度上限时自动分段发送，内容不丢失。
 
@@ -46,11 +46,13 @@
 
 
 
-### 第二步：获取推送 Token
+### 第二步：获取企业微信机器人 Webhook
 
-1. 访问 [PushPlus 官网](https://www.pushplus.plus/)。
-2. 登录并获取您的 **Token**。
-3. （可选）若需推送到群组，请创建一个群组并记录 **群组编码 (Topic)**。
+若希望通过企业微信接收报告：
+
+1. 在企业微信群中添加 **群机器人**。
+2. 在机器人配置页面复制 Webhook 地址。
+3. 将该地址填入仓库 Secrets 的 `WECHAT_WORK_WEBHOOK_URL`。
 
 ### 第二步（可选）：配置 Telegram Bot 通知
 
@@ -61,7 +63,7 @@
 3. 获取 **Chat ID**：浏览器访问 `https://api.telegram.org/bot<你的Token>/getUpdates`，在返回的 JSON 中找到 `chat.id`；也可使用 [@userinfobot](https://t.me/userinfobot) 查询。
 4. 将两个值分别填入 Secrets 的 `TELEGRAM_BOT_TOKEN` 与 `TELEGRAM_CHAT_ID`。
 
-> 通知方式可任选或并存：只配 PushPlus、只配 Telegram、或两者都配均可；都未配置时脚本仅跳过推送，不影响续期执行。
+> 通知方式可任选或并存：只配企业微信、只配 Telegram、或两者都配均可；都未配置时脚本仅跳过推送，不影响续期执行。
 
 ### 第三步：配置 GitHub 仓库
 
@@ -73,8 +75,7 @@
 | ------------------ | ------------------ | ----------------- |
 | `DNSHE_API_KEY`    | DNSHE 的 API Key    | `cfsd_xxxxxxxxxx` |
 | `DNSHE_API_SECRET` | DNSHE 的 API Secret | `yyyyyyyyyyyy`    |
-| `PUSHPLUS_TOKEN`   | PushPlus 的用户令牌     | `9a8b...`         |
-| `PUSHPLUS_TOPIC`   | (可选) PushPlus 群组编码 | `123`             |
+| `WECHAT_WORK_WEBHOOK_URL` | 企业微信机器人 Webhook | `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...` |
 | `TELEGRAM_BOT_TOKEN` | (可选) Telegram Bot Token | `123456:ABC-DEF...` |
 | `TELEGRAM_CHAT_ID`   | (可选) Telegram 目标聊天 ID | `123456789` |
 
