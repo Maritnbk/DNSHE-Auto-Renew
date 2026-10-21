@@ -22,6 +22,16 @@ DEFAULT_BASE_URL = "https://api005.dnshe.com/index.php?m=domain_hub"
 
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
 
+# PushPlus 返回码的含义，摘自官方文档 https://pushplus.plus/doc/guide/code.html
+# 与 https://pushplus.plus/doc/help/limit.html
+# 官方限制：1 分钟 5 次；相同内容 1 小时 3 条；实名用户每日 200 次。
+PUSHPLUS_CODE_HINTS = {
+    900: "当日请求次数已用尽，次日凌晨恢复；请勿继续请求，否则可能延长封禁",
+    903: "accessKey 无效",
+    905: "账号未实名认证，无法调用发送接口",
+    999: "常见于推送频率过快（1分钟5次 / 相同内容1小时3条），请降低频率后重试",
+}
+
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
 TELEGRAM_MESSAGE_LIMIT = 4096
@@ -761,7 +771,17 @@ class PushPlusNotifier:
                 warn(f"PushPlus 响应格式异常: {str(result)[:200]}")
                 return False
             if result.get('code') != 200:
-                warn(f"PushPlus 推送未成功 (code={result.get('code')}): {result.get('msg')}")
+                # PushPlus 的 msg 经常只是笼统的「服务端验证错误」，真正原因
+                # 在 data 里（如「推送频率过快,请降低推送频率」），必须一并显示，
+                # 否则用户完全无从判断是 token 错了还是被限流了。
+                detail = result.get('data')
+                hint = PUSHPLUS_CODE_HINTS.get(result.get('code'))
+                parts = [f"PushPlus 推送未成功 (code={result.get('code')}): {result.get('msg')}"]
+                if detail:
+                    parts.append(f"原因: {detail}")
+                if hint:
+                    parts.append(hint)
+                warn("；".join(parts))
                 return False
             print("PushPlus 推送成功")
             return True
@@ -946,8 +966,18 @@ def build_notifier(config):
     return CompositeNotifier(channels)
 
 
-def build_message(config, quota_text, renewal_results, expiry_lines, has_failure):
+def build_message(config, quota_text, renewal_results, expiry_lines, has_failure, now=None):
     parts = []
+
+    # 首行带运行时间，一举两得：
+    # 1. 报告能看出是哪次运行产生的；
+    # 2. PushPlus 限制「相同内容 1 小时最多 3 条」，内容完全一致时重复运行
+    #    会被判为重复推送（code=999）。时间戳让每次内容都不同。
+    if now is not None:
+        parts.append(f"运行时间：{now.astimezone(config.tz).strftime('%Y-%m-%d %H:%M:%S')} "
+                     f"({format_offset(config.tz)})")
+        parts.append("")
+
     if quota_text:
         parts.append(quota_text)
         parts.append("")
@@ -1058,7 +1088,7 @@ def run(config, client, notifier, now=None):
                 )
                 expiry_lines[-1] = expiry_line(view, now)
 
-    message = build_message(config, quota_text, renewal_results, expiry_lines, has_failure)
+    message = build_message(config, quota_text, renewal_results, expiry_lines, has_failure, now)
     print(message)
     # 推送失败同样算失败：报告发不出去等于没有告警通道
     pushed = notifier.send(message)
