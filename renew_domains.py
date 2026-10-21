@@ -6,12 +6,13 @@ https://my.dnshe.com/knowledgebase/13/DNSHE免费域名API使用文档V2.0.html
 """
 
 import os
+import re
 import sys
 import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -33,7 +34,9 @@ DEFAULT_MIN_INTERVAL = 2
 
 DEFAULT_TZ_OFFSET_HOURS = 8.0
 
-PAGE_SIZE = 200
+# 文档：per_page 上限 500，超过会被服务端截到 500。取上限可减少大账户的
+# 翻页次数，也就减少了触发限流的概率。
+PAGE_SIZE = 500
 MAX_PAGES = 100
 
 LIST_FIELDS = "id,subdomain,rootdomain,full_domain,status,expires_at,never_expires"
@@ -42,9 +45,70 @@ EXPIRY_FORMATS = ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d')
 
 BENIGN_ERROR_CODES = frozenset({'renewal_not_yet_available'})
 
+# 官方文档「Common Error Codes」里对使用者有行动指引的那几条，翻译成下一步该做什么。
+ERROR_HINTS = {
+    'auth_invalid_credentials': 'API Key/Secret 无效，请到 DNSHE 后台重新创建',
+    'auth_ip_not_allowed': '当前出口 IP 不在该密钥的白名单内',
+    'api_access_disabled': 'DNSHE 后台已关闭 API 访问',
+    'quota_exceeded': '账户额度不足',
+    'rate_limit_exceeded': '触发接口频率限制，请调大 DNSHE_MIN_INTERVAL',
+    'provider_operation_failed': '上游 DNS 服务商操作失败，稍后重试',
+    'internal_error': 'DNSHE 服务端内部错误',
+    'subdomain_not_found': '域名不存在或不属于当前 API Key',
+    'not_found': '资源不存在',
+    'bad_request': '请求参数有误',
+}
+
+# 实测线上接口的 status 返回 "Registered"（首字母大写），而文档写的是 active/suspended/expired。
+# 两种口径都按正常状态处理，其余一律在报告里显式标注。
+NORMAL_STATUSES = frozenset({'active', 'registered'})
+
+_TRUE_WORDS = frozenset({'1', 'true', 'yes', 'y', 'on', 't'})
+_FALSE_WORDS = frozenset({'0', 'false', 'no', 'n', 'off', 'f', '', 'none', 'null'})
+
 
 class ApiError(RuntimeError):
     """DNSHE 接口调用失败（含响应结构不符合预期）。"""
+
+
+def to_bool(value, default=False, label=''):
+    """把接口返回值稳妥地转成布尔。
+
+    不能直接用 bool()：PHP 后端把 tinyint 序列化成字符串是常见行为，
+    而 bool("0") / bool("false") 都是 True —— 对 never_expires 来说，
+    这个误判会让域名被永久跳过、报告还显示「永不过期」，属于最坏的静默失效。
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    text = str(value).strip().lower()
+    if text in _TRUE_WORDS:
+        return True
+    if text in _FALSE_WORDS:
+        return False
+
+    warn(f"{label or '布尔字段'}={value!r} 无法识别，按 {default} 处理")
+    return default
+
+
+def parse_id(value):
+    """把 id 归一成 int；无法转换时返回 None（交给上层报「缺少 id」）。
+
+    接口有时把数字序列化成字符串（"12"），原样透传给续期接口虽然大概率
+    能用，但一旦服务端做严格类型校验就会失败，且报错指向不明。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def configure_streams():
@@ -194,7 +258,11 @@ def notify_retry():
 
 
 def describe_error(payload, fallback='未知错误'):
-    """按官方统一错误结构拼出可读信息：error_code + message + details。"""
+    """按官方统一错误结构拼出可读信息：error_code + message + details。
+
+    文档里 422 的 days_until_window / seconds_until_window 是「还要等多久」
+    这个最有用的信息，不能只留一句「尚未进入窗口」。
+    """
     if not isinstance(payload, dict):
         return fallback
 
@@ -203,11 +271,29 @@ def describe_error(payload, fallback='未知错误'):
     text = f"{message} [{code}]" if code else str(message)
 
     details = payload.get('details')
-    if isinstance(details, dict):
-        extra = [f"{k}={details[k]}" for k in ('limit', 'remaining', 'reset_at')
-                 if details.get(k) is not None]
-        if extra:
-            text += f" ({', '.join(extra)})"
+    details = details if isinstance(details, dict) else {}
+
+    def pick(key):
+        """顶层与 details 两处都找：不同错误码把字段放在不同层级。"""
+        for source in (details, payload):
+            if source.get(key) is not None:
+                return source[key]
+        return None
+
+    extra = [f"{k}={pick(k)}" for k in ('limit', 'remaining', 'reset_at')
+             if pick(k) is not None]
+    if extra:
+        text += f" ({', '.join(extra)})"
+
+    days = pick('days_until_window')
+    if days is not None:
+        text += f"，还需等待 {days} 天"
+    elif pick('seconds_until_window') is not None:
+        text += f"，还需等待约 {max(1, int(pick('seconds_until_window')) // 86400)} 天"
+
+    hint = ERROR_HINTS.get(code)
+    if hint:
+        text += f" —— {hint}"
     return text
 
 
@@ -231,6 +317,7 @@ class DnsheClient:
 
     @staticmethod
     def _payload(resp, what):
+        """解析响应体；解析不了时抛出带状态码的 ApiError（而非 HTTPError）。"""
         try:
             data = resp.json()
         except ValueError:
@@ -241,15 +328,39 @@ class DnsheClient:
             raise ApiError(f"{what}响应格式异常: {str(data)[:200]}")
         return data
 
+    @classmethod
+    def _checked(cls, resp, what):
+        """统一处理一次响应：body 里的 error_code 优先于 HTTP 状态码。
+
+        文档明确写着 error_code 是「Stable error code (recommended for
+        business-side processing)」，所以不能先 raise_for_status 再解析——
+        那样只会剩下一句「401 Client Error: Unauthorized」，把
+        auth_invalid_credentials / rate_limit_exceeded 这类可行动信息全丢掉。
+        """
+        try:
+            data = cls._payload(resp, what)
+        except ApiError as parse_error:
+            if resp.status_code >= 400:
+                raise ApiError(
+                    f"{what}失败 (HTTP {resp.status_code}): "
+                    f"{(resp.text or '')[:200] or '空响应'}"
+                )
+            raise parse_error
+
+        if is_failure_payload(data):
+            raise ApiError(f"{what}返回失败: {describe_error(data)}")
+
+        if resp.status_code >= 400:
+            # 状态码是错的但 body 没带错误结构，仍然不能当成功
+            raise ApiError(f"{what}失败 (HTTP {resp.status_code}): {str(data)[:200]}")
+        return data
+
     def get(self, query, what):
         self.throttle.wait()
         resp = self.list_session.get(f"{self.config.base_url}{query}",
-                                     headers=self._headers(), timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = self._payload(resp, what)
-        if is_failure_payload(data):
-            raise ApiError(f"{what}返回失败: {describe_error(data)}")
-        return data
+                                     headers=self._headers(), timeout=REQUEST_TIMEOUT,
+                                     allow_redirects=False)
+        return self._checked(resp, what)
 
     def fetch_quota(self):
         """查询账户积分。返回 quota 字典，失败由调用方决定是否致命。"""
@@ -268,13 +379,19 @@ class DnsheClient:
         collected: List[Any] = []
         seen_ids = set()
         page = 1
+        reported_total = None
 
         while page <= MAX_PAGES:
-            data = self.get(
+            query = (
                 f"&endpoint=subdomains&action=list&fields={LIST_FIELDS}"
-                f"&page={page}&per_page={PAGE_SIZE}",
-                "域名列表",
+                f"&page={page}&per_page={PAGE_SIZE}"
             )
+            # 首页顺带要总数，用于最后的完整性校验；文档提示 include_total 会
+            # 多跑一次 COUNT，只在首页付这个成本。
+            if page == 1:
+                query += "&include_total=1"
+
+            data = self.get(query, "域名列表")
 
             if 'subdomains' not in data:
                 raise ApiError(
@@ -285,6 +402,9 @@ class DnsheClient:
             if not isinstance(batch, list):
                 raise ApiError(f"subdomains 字段不是列表: {str(batch)[:200]}")
 
+            reported_total = self._reported_total(data, reported_total, page)
+            self._check_page_count(data, batch, page)
+
             # 服务端若忽略 page 参数会反复返回同一页，靠 id 去重防止无限累积
             fresh = [item for item in batch if not self._already_seen(item, seen_ids)]
             collected.extend(fresh)
@@ -294,15 +414,72 @@ class DnsheClient:
 
             next_page = self._next_page(data.get('pagination'), page)
             if next_page is None:
-                break
+                # 服务端说还有下一页，却给不出能前进的页码：宁可失败告警，
+                # 也不能静默截断——漏掉的那批域名会一直不续期直到过期。
+                raise ApiError(
+                    f"域名列表分页异常：服务端标记 has_more=true，但第 {page} 页"
+                    f"未能给出可前进的页码（pagination={str(data.get('pagination'))[:120]}），"
+                    "已中止以免漏掉域名"
+                )
             page = next_page
         else:
             raise ApiError(f"域名列表分页超过 {MAX_PAGES} 页，疑似接口异常，已中止")
 
+        self._verify_total(collected, reported_total)
+
         if not collected:
-            # 空列表极可能是凭据失效或接口变更，绝不能当作"无需续期"
+            # 空列表极可能是凭据失效或接口变更，绝不能当作"无需续期"；
+            # 但服务端明确给出 total=0 / count=0 时，那是真的没有域名。
+            if reported_total == 0:
+                print("账户下没有任何子域名，本次无需续期")
+                return []
             raise ApiError("未获取到任何子域名，疑似凭据失效或接口变更，请人工核查")
         return collected
+
+    @staticmethod
+    def _reported_total(data, current, page=1):
+        """读取服务端声明的「总数」，仅首页采信。
+
+        pagination.total 才是总数；顶层 count 是「本页条数」（实测：第 2 页
+        count=50、共 250 个域名），把它当总数会误报数量不一致，所以 count
+        只在首页且没有 total 时退而求其次。
+        """
+        pagination = data.get('pagination')
+        if isinstance(pagination, dict):
+            try:
+                total = int(pagination.get('total'))
+            except (TypeError, ValueError):
+                total = None
+            if total is not None and total >= 0:
+                return total
+        if page == 1:
+            try:
+                count = int(data.get('count'))
+            except (TypeError, ValueError):
+                count = None
+            if count is not None and count >= 0:
+                return count
+        return current
+
+    @staticmethod
+    def _check_page_count(data, batch, page):
+        """本页声明的 count 与实际条数对不上时告警（多为服务端截断）。"""
+        try:
+            declared = int(data.get('count'))
+        except (TypeError, ValueError):
+            return
+        if declared != len(batch):
+            warn(f"第 {page} 页声明 count={declared}，实际返回 {len(batch)} 条，"
+                 "疑似响应被截断")
+
+    @staticmethod
+    def _verify_total(collected, reported_total):
+        """用服务端总数校验是否漏收，不一致时告警（不中止，避免误伤）。"""
+        if reported_total is None:
+            return
+        if len(collected) != reported_total:
+            warn(f"域名数量不一致：服务端声明 {reported_total} 个，实际收到 "
+                 f"{len(collected)} 个，可能有域名未被处理，请人工核查")
 
     @staticmethod
     def _already_seen(item, seen_ids):
@@ -341,20 +518,32 @@ class DnsheClient:
         return candidate if candidate > current else None
 
     def renew(self, subdomain_id):
-        """提交续期。返回解析后的响应体（可能是业务失败），仅传输层问题抛异常。"""
+        """提交续期。返回解析后的响应体（可能是业务失败），仅传输层问题抛异常。
+
+        注意这里不能复用 _checked()：续期的 4xx（如 422 未到窗口）是预期内的
+        业务结果，要原样交给调用方渲染，而不是当异常抛出去。
+        """
         self.throttle.wait()
         resp = self.renew_session.post(
             f"{self.config.base_url}&endpoint=subdomains&action=renew",
             headers=self._headers(), json={"subdomain_id": subdomain_id},
-            timeout=REQUEST_TIMEOUT,
+            timeout=REQUEST_TIMEOUT, allow_redirects=False,
         )
         # 不能直接 raise_for_status：422 renewal_not_yet_available 等业务错误
         # 带着有用的 error_code，丢掉状态码之外的信息会让报告失去可读性。
         try:
-            return self._payload(resp, "续期接口")
-        except ApiError:
-            resp.raise_for_status()
-            raise
+            data = self._payload(resp, "续期接口")
+        except ApiError as parse_error:
+            # 解析失败时不要把原本更具体的 ApiError 换成 HTTPError
+            if resp.status_code >= 400:
+                raise ApiError(f"续期接口失败 (HTTP {resp.status_code}): "
+                               f"{(resp.text or '')[:200] or '空响应'}")
+            raise parse_error
+
+        if resp.status_code >= 500 and not is_failure_payload(data):
+            # 5xx 却给出成功结构，属于自相矛盾，按失败处理避免误报续期成功
+            raise ApiError(f"续期接口异常 (HTTP {resp.status_code}): {str(data)[:200]}")
+        return data
 
 
 @dataclass
@@ -367,6 +556,20 @@ class DomainView:
     expires_at: Optional[datetime] = None
     days_remaining: Optional[int] = None
     problem: Optional[str] = None
+    status: Optional[str] = None
+
+    @property
+    def status_abnormal(self):
+        """状态不是 active/registered 时返回原始状态，否则返回 None。
+
+        实测线上返回的是 "Registered"（文档写 active），两种都算正常；
+        其余取值（suspended/expired/...）说明域名有问题，必须让人看见。
+        """
+        if not self.status:
+            return None
+        if str(self.status).strip().lower() in NORMAL_STATUSES:
+            return None
+        return str(self.status)
 
 
 def parse_expiry(value, tz):
@@ -402,9 +605,13 @@ def inspect_domain(raw, index, now, tz):
     label = raw.get('full_domain') or raw.get('subdomain') or position
     view = DomainView(
         label=label,
-        subdomain_id=raw.get('id'),
-        never_expires=bool(raw.get('never_expires', 0)),
+        subdomain_id=parse_id(raw.get('id')),
+        # 默认按 False（需要续期）处理：接口返回无法识别时，宁可多撞一次 422，
+        # 也不能把真正需要续期的域名误判成永不过期而永久跳过。
+        never_expires=to_bool(raw.get('never_expires', 0), default=False,
+                              label=f"{label}.never_expires"),
         expires_raw=raw.get('expires_at'),
+        status=raw.get('status'),
     )
 
     if view.subdomain_id is None:
@@ -420,28 +627,78 @@ def inspect_domain(raw, index, now, tz):
     return view
 
 
-def decide(view, threshold_days):
-    """判定该域名本次要做什么：invalid / never / skip / renew。"""
+def decide(view, threshold_days, now=None):
+    """判定该域名本次要做什么：invalid / never / skip / renew。
+
+    判定用精确时间差，不用 days_remaining：后者是 .days 向下取整的结果，
+    会把「剩余 180 天 0 小时 30 分」压成 180，再用 >= 180 判成跳过——
+    而文档写的是「Renewal window: Opens 180 days before the expiration」，
+    此刻窗口其实已经开了。
+    """
     if view.problem:
         return 'invalid'
     if view.never_expires:
         return 'never'
+    if view.expires_at is not None and now is not None:
+        if view.expires_at - now > timedelta(days=threshold_days):
+            return 'skip'
+        return 'renew'
+    # 没有 now 时退回按整数天判定（保持纯函数可测）
     if view.days_remaining is not None and view.days_remaining >= threshold_days:
         return 'skip'
     # 剩余天数未知时也尝试续期：宁可撞一次 422，也不要漏掉真要过期的域名
     return 'renew'
 
 
-def expiry_line(view):
+def days_left(view, now):
+    """剩余天数，向上取整（未满一天也算一天）；已过期返回负数。"""
+    if view.expires_at is None:
+        return None
+    delta = view.expires_at - now
+    if delta.total_seconds() < 0:
+        # 已过期：向下取整，避免 -0.5 天显示成 0
+        return -(-delta).days if delta.seconds else delta.days
+    return -((-delta) // timedelta(days=1))
+
+
+def describe_remaining(view, now):
+    """报告里的一句话剩余时间，过期域名显示「已过期 N 天」。"""
+    if view.expires_at is None:
+        return None
+    delta = view.expires_at - now
+    if delta.total_seconds() < 0:
+        return f"已过期 {-delta.days}天"
+    return f"剩余 {days_left(view, now)}天"
+
+
+def status_note(view):
+    """异常状态的附加说明，拼在报告行尾；正常状态返回空串。"""
+    abnormal = view.status_abnormal
+    if not abnormal:
+        return ""
+    if abnormal.lower() == 'expired':
+        return "  ⚠️ 域名状态 expired（已过期，续期窗口可能已关闭）"
+    return f"  ⚠️ 域名状态 {abnormal}"
+
+
+def mark(view, line):
+    """给一行报告追加状态说明。"""
+    return f"{line}{status_note(view)}"
+
+
+def expiry_line(view, now=None):
     if view.problem:
-        return f"{view.label}: 到期时间 未知（记录异常）"
+        return mark(view, f"{view.label}: 到期时间 未知（记录异常）")
     if view.never_expires:
-        return f"{view.label}: 到期时间 永久有效"
+        return mark(view, f"{view.label}: 到期时间 永久有效")
+    remaining = describe_remaining(view, now) if now is not None else None
+    if remaining:
+        return mark(view, f"{view.label}: 到期时间 {view.expires_raw} ({remaining})")
     if view.days_remaining is not None:
-        return f"{view.label}: 到期时间 {view.expires_raw} (剩余 {view.days_remaining}天)"
+        return mark(view, f"{view.label}: 到期时间 {view.expires_raw} (剩余 {view.days_remaining}天)")
     if view.expires_raw:
-        return f"{view.label}: 到期时间 {view.expires_raw} (无法解析剩余天数)"
-    return f"{view.label}: 到期时间 未知"
+        return mark(view, f"{view.label}: 到期时间 {view.expires_raw} (无法解析剩余天数)")
+    return mark(view, f"{view.label}: 到期时间 未知")
 
 
 def format_charge(charged):
@@ -450,7 +707,8 @@ def format_charge(charged):
         if float(charged) == 0:
             return "免费"
     except (TypeError, ValueError):
-        pass
+        # 字段缺失或类型异常时不要把 None 直接拼进报告
+        return "费用未知"
     return f"消耗 {charged} 积分"
 
 
@@ -497,7 +755,12 @@ class PushPlusNotifier:
             except ValueError:
                 warn(f"PushPlus 返回非 JSON 内容: {(resp.text or '')[:200]}")
                 return False
-            if isinstance(result, dict) and result.get('code') != 200:
+            # 响应不是 dict 说明接口行为已变，绝不能当成推送成功——那会让
+            # 整轮运行报「一切正常」，而实际上一条通知都没发出去。
+            if not isinstance(result, dict):
+                warn(f"PushPlus 响应格式异常: {str(result)[:200]}")
+                return False
+            if result.get('code') != 200:
                 warn(f"PushPlus 推送未成功 (code={result.get('code')}): {result.get('msg')}")
                 return False
             print("PushPlus 推送成功")
@@ -507,25 +770,65 @@ class PushPlusNotifier:
             return False
 
 
+def utf16_len(text):
+    """按 UTF-16 码元计长度。
+
+    Telegram 的 4096 上限是 UTF-16 code unit，不是 Python 的字符数：
+    BMP 外的 emoji（😀🎉🚀 等）在 UTF-16 里占 2 个码元，用 len() 会低估，
+    切出来的消息可能超限被拒（400 MESSAGE_TOO_LONG）。
+    """
+    return len(text.encode('utf-16-le')) // 2
+
+
 def split_message(content, limit=TELEGRAM_MESSAGE_LIMIT):
-    """把超长报告切成若干条不超过 limit 的消息。
+    """把超长报告切成若干条不超过 limit 个 UTF-16 码元的消息。
 
     优先在最近的换行处断开，避免把一行域名记录切成两半；
     单行本身就超限时才在行内硬切。
     """
     chunks = []
     remaining = content
-    while len(remaining) > limit:
-        cut = remaining.rfind('\n', 0, limit + 1)
+    while utf16_len(remaining) > limit:
+        # 先定位「不超过 limit 个码元」的最长前缀，再在其中找换行
+        hard = _utf16_prefix_len(remaining, limit)
+        cut = remaining.rfind('\n', 0, hard + 1)
         if cut <= 0:
-            cut = limit
+            cut = hard
         chunks.append(remaining[:cut])
         remaining = remaining[cut:].lstrip('\n')
     chunks.append(remaining)
     return chunks
 
 
-def telegram_error_detail(resp):
+def _utf16_prefix_len(text, limit):
+    """返回不超过 limit 个 UTF-16 码元的最长前缀长度（按字符计）。"""
+    used = 0
+    for index, char in enumerate(text):
+        used += 2 if ord(char) > 0xFFFF else 1
+        if used > limit:
+            return index
+    return len(text)
+
+
+def redact(text, secrets=()):
+    """把日志文本里出现的密钥替换成占位符。
+
+    requests 的连接异常消息会带上完整 URL，而 Telegram 的 URL 里就嵌着
+    bot token（/bot<token>/sendMessage）。公开仓库的 Actions 日志人人可见，
+    不脱敏等于把 token 直接写进日志。
+    """
+    result = str(text)
+    for secret in secrets:
+        # 太短的串（如测试里的单字符 token）做全局替换会把正常文本也切碎，
+        # 反而毁掉错误信息。真实 token 都远超这个长度。
+        if secret and len(secret) >= 8:
+            result = result.replace(secret, '<已脱敏>')
+    # 兜底：即使没拿到 token 值，也把 /bot<...>/ 这种形状抹掉
+    result = re.sub(r'/bot[^/\s]+/', '/bot<已脱敏>/', result)
+    return result
+
+
+def telegram_error_detail(resp, bot_token=''):
     """提取错误响应体里的原因。
 
     Telegram 的 4xx/5xx 响应体带 JSON description（如「bot was blocked by
@@ -534,10 +837,10 @@ def telegram_error_detail(resp):
     try:
         payload = resp.json()
     except ValueError:
-        return (resp.text or '')[:200]
+        return redact((resp.text or '')[:200], (bot_token,))
     if isinstance(payload, dict) and payload.get('description'):
-        return str(payload['description'])
-    return str(payload)[:200]
+        return redact(str(payload['description']), (bot_token,))
+    return redact(str(payload)[:200], (bot_token,))
 
 
 class TelegramNotifier:
@@ -568,12 +871,20 @@ class TelegramNotifier:
                 try:
                     result = resp.json()
                 except ValueError:
-                    warn(f"Telegram 返回非 JSON 内容: {(resp.text or '')[:200]}")
+                    warn(f"Telegram 返回非 JSON 内容: "
+                         f"{redact((resp.text or '')[:200], (self.bot_token,))}")
                     ok = False
                     continue
-                # Telegram 约定 ok=true 为成功；ok=false 时 description 带原因
-                if not (isinstance(result, dict) and result.get('ok')):
-                    warn(f"Telegram 第 {index} 段推送未成功: {result.get('description', result)}")
+                # Telegram 约定 ok=true 为成功；ok=false 时 description 带原因。
+                # 响应不是 dict 时不能直接 .get()，否则 AttributeError 会被
+                # 下面的 except 吞成「推送失败」，看不出真实原因。
+                if not isinstance(result, dict):
+                    warn(f"Telegram 第 {index} 段响应格式异常: "
+                         f"{redact(str(result)[:200], (self.bot_token,))}")
+                    ok = False
+                elif not result.get('ok'):
+                    warn(f"Telegram 第 {index} 段推送未成功: "
+                         f"{redact(str(result.get('description', result)), (self.bot_token,))}")
                     ok = False
             except Exception as e:
                 # raise_for_status 抛出的 HTTPError 带着响应体，里面的
@@ -581,9 +892,12 @@ class TelegramNotifier:
                 err_resp = getattr(e, 'response', None)
                 if err_resp is not None:
                     warn(f"Telegram 第 {index} 段推送失败 "
-                         f"(HTTP {err_resp.status_code}): {telegram_error_detail(err_resp)}")
+                         f"(HTTP {err_resp.status_code}): "
+                         f"{telegram_error_detail(err_resp, self.bot_token)}")
                 else:
-                    warn(f"Telegram 第 {index} 段推送失败: {e}")
+                    # 连接异常的消息里带着含 token 的 URL，必须脱敏
+                    warn(f"Telegram 第 {index} 段推送失败: "
+                         f"{redact(e, (self.bot_token,))}")
                 ok = False
         if ok:
             print("Telegram 推送成功")
@@ -593,9 +907,12 @@ class TelegramNotifier:
 class CompositeNotifier:
     """把报告分发给所有已配置的通知通道。
 
-    - 未配置任何通道：提示后视为成功（与原先无 PushPlus token 时一致）
-    - 任一已配置通道失败：返回 False，让进程以退出码 1 收场——
-      报告发不出去等于没有告警通道
+    失败语义：只要有「任一」通道送达就算送达。原先是 all(...)，PushPlus
+    成功、Telegram 偶发失败时退出码也是 1，Actions 里显示红色失败——可报告
+    其实已经发出去了，这是误报。全部通道都失败才算推送失败。
+
+    - 未配置任何通道：提示后视为成功
+    - 所有已配置通道都失败：返回 False，让进程以退出码 1 收场
     """
 
     def __init__(self, channels):
@@ -605,7 +922,16 @@ class CompositeNotifier:
         if not self.channels:
             print("未配置任何通知通道，跳过推送")
             return True
-        return all(channel.send(content) for channel in self.channels)
+        # 不能用 all(...)：all() 遇到第一个 False 就短路，后面的通道根本不会
+        # 被调用。PushPlus 挂掉时 Telegram 也就收不到——恰恰是最需要备份通道
+        # 的时刻。这里必须全部执行完再汇总。
+        results = [channel.send(content) for channel in self.channels]
+        delivered = any(results)
+        if not delivered:
+            warn(f"所有 {len(results)} 个通知通道均推送失败")
+        elif not all(results):
+            warn("部分通知通道推送失败，但报告已通过其余通道送达")
+        return delivered
 
 
 def build_notifier(config):
@@ -656,8 +982,12 @@ def renew_one(client, view):
     """续期单个域名。"""
     try:
         payload = client.renew(view.subdomain_id)
-    except Exception as e:
+    except ApiError as e:
+        # 只兜接口层错误；编程错误（AttributeError/TypeError 等）应当抛出，
+        # 否则会被伪装成「请求异常」，掩盖真正的 bug。
         return RenewOutcome(f"❌ {view.label}: 请求异常 ({e})", True)
+    except requests.RequestException as e:
+        return RenewOutcome(f"❌ {view.label}: 网络异常 ({e})", True)
 
     if payload.get('success'):
         new_expiry = payload.get('new_expires_at') or ''
@@ -702,22 +1032,22 @@ def run(config, client, notifier, now=None):
 
     for index, raw in enumerate(subdomains):
         view = inspect_domain(raw, index, now, config.tz)
-        expiry_lines.append(expiry_line(view))
-        action = decide(view, config.threshold_days)
+        expiry_lines.append(expiry_line(view, now))
+        action = decide(view, config.threshold_days, now)
 
         if action == 'invalid':
             has_failure = True
             renewal_results.append(f"❌ {view.label}: {view.problem}")
         elif action == 'never':
-            renewal_results.append(f"⏭️ {view.label}: 已设置为永不过期，跳过续期")
+            renewal_results.append(mark(view, f"⏭️ {view.label}: 已设置为永不过期，跳过续期"))
         elif action == 'skip':
-            renewal_results.append(
-                f"⏭️ {view.label}: 剩余 {view.days_remaining}天 "
-                f">= {config.threshold_days}天，跳过续期"
-            )
+            renewal_results.append(mark(view, (
+                f"⏭️ {view.label}: {describe_remaining(view, now)} "
+                f"> {config.threshold_days}天，尚未进入续期窗口，跳过"
+            )))
         else:
             outcome = renew_one(client, view)
-            renewal_results.append(outcome.line)
+            renewal_results.append(mark(view, outcome.line))
             has_failure = has_failure or outcome.failed
             if outcome.new_expiry:
                 # 续期成功后刷新到期清单，避免第二段显示续期前的旧时间
@@ -726,7 +1056,7 @@ def run(config, client, notifier, now=None):
                 view.days_remaining = (
                     (view.expires_at - now).days if view.expires_at else None
                 )
-                expiry_lines[-1] = expiry_line(view)
+                expiry_lines[-1] = expiry_line(view, now)
 
     message = build_message(config, quota_text, renewal_results, expiry_lines, has_failure)
     print(message)

@@ -1,0 +1,24 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q --strict-markers"
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# E/F: pycodestyle + pyflakes 基础错误
+# I: import 排序
+# UP: 用现代语法替换过时写法
+# B: bugbear，捕捉常见的逻辑陷阱（如 except 后 pass）
+# SIM: 简化建议
+select = ["E", "F", "W", "I", "B", "SIM"]
+ignore = [
+    "E501",  # 行长由 formatter 负责，避免中文字符导致误报
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里允许 assert 和较长的测试数据
+"tests/*" = ["S101"]

@@ -1,0 +1,10 @@
+# 本地凭据，切勿提交
+key.txt
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/

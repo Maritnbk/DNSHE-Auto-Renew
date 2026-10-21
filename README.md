@@ -16,6 +16,24 @@
 
 ## 📝 更新说明
 
+（2026-10-21）
+
+- **修复静默误判**：`never_expires` 为字符串 `"0"` 时曾被当成「永不过期」而永久跳过续期，现按正确语义解析。
+
+- **错误信息可读**：保留官方 `error_code` 并给出处理建议（此前 401 只显示一句 `Unauthorized`）；未到续期窗口时会提示还需等待多少天。
+
+- **通知不再短路**：此前 PushPlus 失败会导致 Telegram 完全不被调用，现已修复。
+
+- **分页不再静默截断**：服务端分页异常时改为显式报错，并用接口返回的总数校验是否漏收域名。
+
+- **域名状态可见**：被暂停 / 已过期的域名会在报告中标注。
+
+- **阈值边界修正**：剩余正好 180 天时不再被误判为「跳过」。
+
+- **日志脱敏**：推送失败的日志不再泄漏 Telegram Bot Token。
+
+- **运行频率**：cron 错开到非整点执行，避免 GitHub Actions 高负载时被延迟或丢弃。
+
 （2026-08-21）
 
 - **通知渠道扩展**：新增 Telegram Bot 通知方式，可与 PushPlus 并存，未配置则自动跳过。
@@ -52,7 +70,7 @@
 2. 登录并获取您的 **Token**。
 3. （可选）若需推送到群组，请创建一个群组并记录 **群组编码 (Topic)**。
 
-### 第二步（可选）：配置 Telegram Bot 通知
+### （可选）：配置 Telegram Bot 通知
 
 若希望同时通过 Telegram 接收报告：
 
@@ -69,32 +87,53 @@
 2. 进入仓库设置：**Settings** -> **Secrets and variables** -> **Actions**。
 3. 点击 **New repository secret**，依次添加以下变量：
 
-| 变量名称               | 说明                 | 示例                |
-| ------------------ | ------------------ | ----------------- |
-| `DNSHE_API_KEY`    | DNSHE 的 API Key    | `cfsd_xxxxxxxxxx` |
-| `DNSHE_API_SECRET` | DNSHE 的 API Secret | `yyyyyyyyyyyy`    |
-| `PUSHPLUS_TOKEN`   | PushPlus 的用户令牌     | `9a8b...`         |
-| `PUSHPLUS_TOPIC`   | (可选) PushPlus 群组编码 | `123`             |
+| 变量名称                 | 说明                      | 示例                  |
+| -------------------- | ----------------------- | ------------------- |
+| `DNSHE_API_KEY`      | DNSHE 的 API Key         | `cfsd_xxxxxxxxxx`   |
+| `DNSHE_API_SECRET`   | DNSHE 的 API Secret      | `yyyyyyyyyyyy`      |
+| `PUSHPLUS_TOKEN`     | PushPlus 的用户令牌          | `9a8b...`           |
+| `PUSHPLUS_TOPIC`     | (可选) PushPlus 群组编码      | `123`               |
 | `TELEGRAM_BOT_TOKEN` | (可选) Telegram Bot Token | `123456:ABC-DEF...` |
-| `TELEGRAM_CHAT_ID`   | (可选) Telegram 目标聊天 ID | `123456789` |
+| `TELEGRAM_CHAT_ID`   | (可选) Telegram 目标聊天 ID   | `123456789`         |
+
+> 只要有一个通知通道送达即视为成功；所有通道都失败才会让工作流标红。
+
+#### 可选配置（Repository variables，非敏感）
+
+在 **Settings** -> **Secrets and variables** -> **Actions** -> **Variables** 中添加，不配则用默认值：
+
+| 变量名称                         | 默认值                                               | 说明                                     |
+| ---------------------------- | ------------------------------------------------- | -------------------------------------- |
+| `DNSHE_RENEW_THRESHOLD_DAYS` | `180`                                             | 剩余天数不超过该值时才续期（官方窗口为到期前 180 天）          |
+| `DNSHE_MIN_INTERVAL`         | `2`                                               | 相邻两次 API 调用的最小间隔（秒）                    |
+| `DNSHE_TZ_OFFSET`            | `8`                                               | 解析到期时间用的时区偏移。**非中国时区用户务必修改**，否则剩余天数会算错 |
+| `DNSHE_API_BASE_URL`         | `https://api005.dnshe.com/index.php?m=domain_hub` | 接口地址，一般无需修改                            |
 
 ### 第四步：启用自动化
 
+> ⚠️ **Fork 之后定时任务默认是关闭的**，必须手动启用，否则它永远不会自己运行。
+> 这是「配置完以为在跑、其实一次都没跑过」最常见的原因。
+
 1. 点击仓库顶部的 **Actions** 选项卡。
-2. 在左侧选择 **"DNSHE Domain Auto Renew"** 工作流。
-3. 点击 **Run workflow** 手动触发一次，验证配置是否正确。
+2. 若看到提示，点击 **I understand my workflows, go ahead and enable them**。
+3. 在左侧选择 **"DNSHE Domain Auto Renew"** 工作流，点击 **Enable workflow**（若已启用则跳过）。
+4. 点击 **Run workflow** 手动触发一次，验证配置是否正确。
 
 ***
 
 ## 📅 运行计划
 
-- **执行频率**：每月 1 日北京时间 08:00。
+- **执行频率**：每月 1 日北京时间 08:23。刻意避开整点——GitHub 官方文档说明 `schedule` 在高负载时会延迟甚至丢弃任务，而「每个整点」正是高负载时段。
 
-- **速率限制**：脚本遵循 API 默认的 60 请求 / 分钟限制 。
+- **速率限制**：官方文档对默认额度有两处不同表述（30 次/分与 60 次/分），脚本按 2 秒间隔保守节流，两种口径下都安全。如需调整请改 `DNSHE_MIN_INTERVAL`。
 
-- **错误处理**：若续期失败，推送消息中将包含具体的错误原因（如认证失败、资源不存在等） 。
+- **错误处理**：续期失败时，推送消息会带上官方 `error_code` 与可读原因（如认证失败、额度不足、尚未进入续期窗口还需等待多少天）。
 
+- **⚠️ 长期不动的仓库会被自动停用**：GitHub 会在公开仓库 60 天无活动后自动禁用定时工作流。建议每两个月手动 Run 一次，或给仓库点个 star / 提交一次改动来保活。
 
+- **报告内容**：推送分两段——第一段是本次续期结果，第二段列出全部域名的到期时间。域名较多时 Telegram 会自动分成多条消息发送。
+
+- **时区**：脚本按 `DNSHE_TZ_OFFSET`（默认 UTC+8）解读接口返回的到期时间。接口返回的是不带时区的本地时间字符串，**如果你的账号不在 UTC+8，必须改这个值**，否则「剩余天数」会整体偏移。
 
 ## ⚠️ 安全建议
 
@@ -104,11 +143,34 @@
 
 - **最小权限**：建议仅为该脚本配置必要的 API 访问权限 。
 
-
+- **日志脱敏**：推送失败时打印的异常信息会自动抹掉 Bot Token，可安全地贴到 issue 里。
 
 ***
 
+## 🧪 本地开发
 
+```bash
+pip install -r requirements.txt
+pip install pytest ruff
+
+ruff check .        # 静态检查
+python -m pytest    # 运行测试（也可用 python -m unittest discover -s tests）
+```
+
+测试覆盖了所有已知的边界情况（`never_expires` 的字符串形式、分页异常、阈值边界、Telegram 消息长度等），修改代码后请确保全部通过。
+
+本地手动跑一次脚本：
+
+```bash
+export DNSHE_API_KEY=... DNSHE_API_SECRET=...
+export PUSHPLUS_TOKEN=...      # 可选
+export TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...   # 可选
+python renew_domains.py
+```
+
+> 注意：`key.txt`、`.env` 等本地凭据文件已在 `.gitignore` 中排除，请勿提交。
+
+***
 
 ## 🙏 致谢
 
@@ -116,10 +178,4 @@
 
 - [**DNSHE**](https://www.dnshe.com/)
 
-- [**OpenCode**](https://github.com/nicepkg/opencode)
-
 - [**DeepSeek**](https://platform.deepseek.com/usage)
-
-- [**Google Gemini**](https://aistudio.google.com/)
-
-***
