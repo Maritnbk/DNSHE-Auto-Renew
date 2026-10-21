@@ -147,24 +147,16 @@
 
 ***
 
-## 🧪 本地开发
+## 🧪 本地运行
 
 ```bash
 pip install -r requirements.txt
-pip install pytest ruff
 
-ruff check .        # 静态检查
-python -m pytest    # 运行测试（也可用 python -m unittest discover -s tests）
-```
-
-测试覆盖了所有已知的边界情况（`never_expires` 的字符串形式、分页异常、阈值边界、Telegram 消息长度等），修改代码后请确保全部通过。
-
-本地手动跑一次脚本：
-
-```bash
-export DNSHE_API_KEY=... DNSHE_API_SECRET=...
-export PUSHPLUS_TOKEN=...      # 可选
+export DNSHE_API_KEY=...
+export DNSHE_API_SECRET=...
+export PUSHPLUS_TOKEN=...                            # 可选
 export TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...   # 可选
+
 python renew_domains.py
 ```
 
