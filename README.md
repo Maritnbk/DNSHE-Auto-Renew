@@ -12,9 +12,15 @@
 
 - **安全合规**：采用 GitHub Secrets 管理密钥，不在代码中硬编码敏感信息 。
 
+- **隐私保护**：对日志和推送通知中的域名进行脱敏打码（如 `fxxxxx.dxx.nxx`），防止公开仓库日志泄露隐私。
+
 ***
 
 ## 📝 更新说明
+
+（2026-10-28）
+
+- **新增域名脱敏**：为避免 Actions 公开日志泄露具体域名，默认将域名打码（如 `fxxxxx.dxx.nxx`），可通过 `DNSHE_MASK_DOMAIN` 变量控制。
 
 （2026-10-21）
 
@@ -108,6 +114,7 @@
 | `DNSHE_MIN_INTERVAL`         | `2`                                               | 相邻两次 API 调用的最小间隔（秒）                    |
 | `DNSHE_TZ_OFFSET`            | `8`                                               | 解析到期时间用的时区偏移。**非中国时区用户务必修改**，否则剩余天数会算错 |
 | `DNSHE_API_BASE_URL`         | `https://api005.dnshe.com/index.php?m=domain_hub` | 接口地址，一般无需修改                            |
+| `DNSHE_MASK_DOMAIN`          | `true`                                            | 是否对日志和推送中的域名打码脱敏（设为 `false` 则显示完整域名）   |
 
 ### 第四步：启用自动化
 
@@ -143,7 +150,7 @@
 
 - **最小权限**：建议仅为该脚本配置必要的 API 访问权限 。
 
-- **日志脱敏**：推送失败时打印的异常信息会自动抹掉 Bot Token，可安全地贴到 issue 里。
+- **日志脱敏**：推送失败时打印的异常信息会自动抹掉 Bot Token；报告中的域名默认打码脱敏，可安全地贴到 issue 里。
 
 ***
 
@@ -158,16 +165,3 @@ export PUSHPLUS_TOKEN=...                            # 可选
 export TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...   # 可选
 
 python renew_domains.py
-```
-
-> 注意：`key.txt`、`.env` 等本地凭据文件已在 `.gitignore` 中排除，请勿提交。
-
-***
-
-## 🙏 致谢
-
-本项目得以实现，特别感谢以下平台与技术的支持：
-
-- [**DNSHE**](https://www.dnshe.com/)
-
-- [**DeepSeek**](https://platform.deepseek.com/usage)

@@ -170,6 +170,25 @@ def format_offset(tz):
     return f"UTC{sign}{hours}" + (f":{minutes:02d}" if minutes else "")
 
 
+def mask_domain(domain):
+    """把域名脱敏成 fxxxxx.dxx.nxx 形式，保留每段首字符与长度。
+
+    用于 GitHub Actions 公开日志与通知内容，避免泄露具体子域名。
+    不含点的字符串（如占位符）原样返回。
+    """
+    text = str(domain)
+    if '.' not in text:
+        return text
+    parts = text.split('.')
+    masked = []
+    for part in parts:
+        if not part:
+            masked.append(part)
+        else:
+            masked.append(part[0] + 'x' * (len(part) - 1))
+    return '.'.join(masked)
+
+
 @dataclass(frozen=True)
 class Config:
     api_key: str = ""
@@ -182,6 +201,7 @@ class Config:
     threshold_days: int = DEFAULT_THRESHOLD_DAYS
     min_interval: float = DEFAULT_MIN_INTERVAL
     tz: timezone = field(default_factory=lambda: timezone(timedelta(hours=DEFAULT_TZ_OFFSET_HOURS)))
+    mask_domain: bool = True
 
     @classmethod
     def from_env(cls, env=None):
@@ -203,6 +223,8 @@ class Config:
             min_interval=env_number(env, 'DNSHE_MIN_INTERVAL',
                                     DEFAULT_MIN_INTERVAL, float),
             tz=parse_tz_offset(env.get('DNSHE_TZ_OFFSET')),
+            mask_domain=to_bool(env.get('DNSHE_MASK_DOMAIN'), default=True,
+                                label='DNSHE_MASK_DOMAIN'),
         )
 
     def missing_credentials(self):
@@ -606,13 +628,18 @@ def parse_expiry(value, tz):
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=tz)
 
 
-def inspect_domain(raw, index, now, tz):
+def inspect_domain(raw, index, now, tz, mask=True):
     """把接口返回的一条记录转成 DomainView，任何字段异常都不得中断遍历。"""
     position = f"<第{index + 1}条记录>"
     if not isinstance(raw, dict):
         return DomainView(label=position, problem=f"记录格式异常: {str(raw)[:80]}")
 
-    label = raw.get('full_domain') or raw.get('subdomain') or position
+    raw_label = raw.get('full_domain') or raw.get('subdomain')
+    if raw_label:
+        label = mask_domain(raw_label) if mask else raw_label
+    else:
+        label = position
+
     view = DomainView(
         label=label,
         subdomain_id=parse_id(raw.get('id')),
@@ -1061,7 +1088,7 @@ def run(config, client, notifier, now=None):
     has_failure = False
 
     for index, raw in enumerate(subdomains):
-        view = inspect_domain(raw, index, now, config.tz)
+        view = inspect_domain(raw, index, now, config.tz, mask=config.mask_domain)
         expiry_lines.append(expiry_line(view, now))
         action = decide(view, config.threshold_days, now)
 
